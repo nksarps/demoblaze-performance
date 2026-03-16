@@ -1,0 +1,412 @@
+name: DemoBlaze Performance Tests
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  JMETER_VERSION: "5.6.3"
+
+jobs:
+  performance-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Java (required by JMeter) ───────────────────────────────────────────
+      - name: Set up Java 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: "11"
+          distribution: temurin
+
+      # ── 3. Install Apache JMeter ───────────────────────────────────────────────
+      - name: Install Apache JMeter ${{ env.JMETER_VERSION }}
+        run: |
+          wget -q "https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${JMETER_VERSION}.tgz"
+          tar -xzf "apache-jmeter-${JMETER_VERSION}.tgz"
+          echo "JMETER_HOME=$PWD/apache-jmeter-${JMETER_VERSION}" >> "$GITHUB_ENV"
+          echo "$PWD/apache-jmeter-${JMETER_VERSION}/bin" >> "$GITHUB_PATH"
+
+      # ── 4. Clean + create directories ─────────────────────────────────────────
+      - name: Prepare result and report directories
+        run: |
+          mkdir -p results
+          # Remove any pre-committed report output so jmeter -o can write cleanly
+          for scene in baseline_load medium_load peak_load stress_test endurance_test; do
+            rm -rf "reports/${scene}"
+          done
+
+      # ── 5. Execute all thread groups (results go to separate JTL files) ────────
+      - name: Run JMeter performance tests (non-GUI)
+        run: |
+          jmeter -n \
+            -t DemoBlaze_Performance_Test_Plan.jmx \
+            -j results/jmeter.log
+        # continue-on-error so report generation and notifications still run
+        # even when individual samplers fail assertions
+        continue-on-error: true
+
+      # ── 6. Generate per-thread-group HTML dashboard reports ───────────────────
+      - name: Generate HTML report — Baseline Load
+        run: jmeter -g results/baseline_load.jtl -o reports/baseline_load
+        continue-on-error: true
+
+      - name: Generate HTML report — Medium Load
+        run: jmeter -g results/medium_load.jtl -o reports/medium_load
+        continue-on-error: true
+
+      - name: Generate HTML report — Peak Load
+        run: jmeter -g results/peak_load.jtl -o reports/peak_load
+        continue-on-error: true
+
+      - name: Generate HTML report — Stress Test
+        run: jmeter -g results/stress_test.jtl -o reports/stress_test
+        continue-on-error: true
+
+      - name: Generate HTML report — Endurance Test
+        run: jmeter -g results/endurance_test.jtl -o reports/endurance_test
+        continue-on-error: true
+
+      # ── 7. Upload each report as a separate downloadable artifact ─────────────
+      - name: Upload Baseline Load report
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-baseline-load
+          path: reports/baseline_load/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload Medium Load report
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-medium-load
+          path: reports/medium_load/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload Peak Load report
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-peak-load
+          path: reports/peak_load/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload Stress Test report
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-stress-test
+          path: reports/stress_test/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload Endurance Test report
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-endurance-test
+          path: reports/endurance_test/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload JMeter execution log
+        uses: actions/upload-artifact@v4
+        with:
+          name: jmeter-log
+          path: results/jmeter.log
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ── 8. Parse statistics.json files → build consolidated summary ───────────
+      # Each HTML report directory contains a statistics.json produced by jmeter -g.
+      # The "Total" key holds the aggregated sampleCount, errorCount, and errorPct
+      # for all requests in that thread group, which is exactly what we need.
+      - name: Parse JMeter results and build summary
+        id: parse_results
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+
+          GROUPS = [
+              ("Baseline Load",  "reports/baseline_load/statistics.json"),
+              ("Medium Load",    "reports/medium_load/statistics.json"),
+              ("Peak Load",      "reports/peak_load/statistics.json"),
+              ("Stress Test",    "reports/stress_test/statistics.json"),
+              ("Endurance Test", "reports/endurance_test/statistics.json"),
+          ]
+
+          results = []
+          for name, stats_path in GROUPS:
+              total, errors, error_pct = 0, 0, 0.0
+              if os.path.isfile(stats_path):
+                  with open(stats_path, encoding="utf-8") as fh:
+                      data = json.load(fh)
+                  total_key = data.get("Total") or data.get("total")
+                  if total_key:
+                      total     = total_key.get("sampleCount", 0)
+                      errors    = total_key.get("errorCount",  0)
+                      error_pct = total_key.get("errorPct",    0.0)
+              pass_pct = round(100.0 - error_pct, 2)
+              fail_pct = round(error_pct, 2)
+              results.append({
+                  "name":     name,
+                  "total":    total,
+                  "errors":   errors,
+                  "pass_pct": pass_pct,
+                  "fail_pct": fail_pct,
+              })
+
+          # Persist for notification steps
+          os.makedirs("results", exist_ok=True)
+          with open("results/summary.json", "w") as fh:
+              json.dump(results, fh, indent=2)
+
+          # ── GitHub job summary (visible in Actions UI) ──────────────────────
+          md_lines = [
+              "## :bar_chart: DemoBlaze Performance Test Results\n",
+              "| Thread Group | Total Samples | Errors | Pass % | Fail % |",
+              "|---|---:|---:|---:|---:|",
+          ]
+          for r in results:
+              status = ":white_check_mark:" if r["fail_pct"] == 0.0 else ":warning:"
+              md_lines.append(
+                  f"| {status} {r['name']} | {r['total']} | {r['errors']} "
+                  f"| **{r['pass_pct']}%** | {r['fail_pct']}% |"
+              )
+          md_table = "\n".join(md_lines) + "\n"
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(md_table)
+
+          print(md_table)
+          PYEOF
+
+      # ── 9. Slack notification ──────────────────────────────────────────────────
+      - name: Send Slack notification
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, urllib.request, urllib.error
+
+          summary_path = "results/summary.json"
+          if os.path.isfile(summary_path):
+              with open(summary_path, encoding="utf-8") as fh:
+                  results = json.load(fh)
+          else:
+              results = []
+
+          webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
+          if not webhook:
+              print("SLACK_WEBHOOK_URL secret is not set — skipping Slack notification.")
+              raise SystemExit(0)
+
+          repo      = os.environ.get("GITHUB_REPOSITORY",  "N/A")
+          run_id    = os.environ.get("GITHUB_RUN_ID",       "N/A")
+          ref       = os.environ.get("GITHUB_REF_NAME",     "N/A")
+          actor     = os.environ.get("GITHUB_ACTOR",        "N/A")
+          server    = os.environ.get("GITHUB_SERVER_URL",   "https://github.com")
+          run_url   = f"{server}/{repo}/actions/runs/{run_id}"
+
+          # Build a monospaced ASCII table that renders cleanly inside a Slack code block
+          col_w = [18, 9, 8, 8, 8]
+          header = (
+              f"{'Thread Group':<{col_w[0]}} "
+              f"{'Samples':>{col_w[1]}} "
+              f"{'Errors':>{col_w[2]}} "
+              f"{'Pass %':>{col_w[3]}} "
+              f"{'Fail %':>{col_w[4]}}"
+          )
+          sep = "\u2500" * (sum(col_w) + len(col_w) - 1)
+          rows = "\n".join(
+              f"{r['name']:<{col_w[0]}} "
+              f"{r['total']:>{col_w[1]}} "
+              f"{r['errors']:>{col_w[2]}} "
+              f"{str(r['pass_pct']) + '%':>{col_w[3]}} "
+              f"{str(r['fail_pct']) + '%':>{col_w[4]}}"
+              for r in results
+          ) if results else "  No result data available."
+
+          table_block = f"```\n{header}\n{sep}\n{rows}\n```"
+
+          payload = {
+              "blocks": [
+                  {
+                      "type": "header",
+                      "text": {
+                          "type": "plain_text",
+                          "text": ":bar_chart: DemoBlaze Performance Test Results",
+                          "emoji": True,
+                      },
+                  },
+                  {
+                      "type": "section",
+                      "fields": [
+                          {"type": "mrkdwn", "text": f"*Repository:*\n<{server}/{repo}|{repo}>"},
+                          {"type": "mrkdwn", "text": f"*Branch / Ref:*\n`{ref}`"},
+                          {"type": "mrkdwn", "text": f"*Triggered by:*\n{actor}"},
+                          {"type": "mrkdwn", "text": f"*Actions run:*\n<{run_url}|#{run_id}>"},
+                      ],
+                  },
+                  {"type": "divider"},
+                  {
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*Thread Group Summary*\n\n{table_block}",
+                      },
+                  },
+                  {
+                      "type": "context",
+                      "elements": [
+                          {
+                              "type": "mrkdwn",
+                              "text": (
+                                  "Full HTML dashboard reports are available as downloadable "
+                                  f"artifacts in the <{run_url}|Actions run>."
+                              ),
+                          }
+                      ],
+                  },
+              ]
+          }
+
+          data = json.dumps(payload).encode("utf-8")
+          req  = urllib.request.Request(
+              webhook, data=data, headers={"Content-Type": "application/json"}
+          )
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  print(f"Slack response: {resp.status} {resp.read().decode()}")
+          except urllib.error.HTTPError as exc:
+              print(f"Slack HTTP error {exc.code}: {exc.read().decode()}")
+              raise
+          PYEOF
+
+      # ── 10. Email notification ────────────────────────────────────────────────
+      - name: Send email notification
+        if: always()
+        env:
+          SMTP_SERVER:   ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT:     ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM:    ${{ secrets.NOTIFY_EMAIL_FROM }}
+          EMAIL_TO:      ${{ secrets.NOTIFY_EMAIL_TO }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, smtplib
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text      import MIMEText
+
+          summary_path = "results/summary.json"
+          if os.path.isfile(summary_path):
+              with open(summary_path, encoding="utf-8") as fh:
+                  results = json.load(fh)
+          else:
+              results = []
+
+          smtp_server   = os.environ.get("SMTP_SERVER",   "")
+          smtp_port     = int(os.environ.get("SMTP_PORT", "587"))
+          smtp_username = os.environ.get("SMTP_USERNAME", "")
+          smtp_password = os.environ.get("SMTP_PASSWORD", "")
+          email_from    = os.environ.get("EMAIL_FROM",    "")
+          email_to      = os.environ.get("EMAIL_TO",      "")
+
+          if not all([smtp_server, smtp_username, smtp_password, email_from, email_to]):
+              print("One or more email secrets are not configured — skipping email notification.")
+              raise SystemExit(0)
+
+          repo    = os.environ.get("GITHUB_REPOSITORY", "N/A")
+          run_id  = os.environ.get("GITHUB_RUN_ID",      "N/A")
+          ref     = os.environ.get("GITHUB_REF_NAME",    "N/A")
+          actor   = os.environ.get("GITHUB_ACTOR",       "N/A")
+          server  = os.environ.get("GITHUB_SERVER_URL",  "https://github.com")
+          run_url = f"{server}/{repo}/actions/runs/{run_id}"
+
+          # Build HTML table rows
+          def row_style(fail_pct):
+              return "background:#fff0f0" if fail_pct > 0 else ""
+
+          rows_html = "".join(
+              f"<tr style='{row_style(r['fail_pct'])}'>"
+              f"<td style='padding:8px 12px;border:1px solid #ddd'>{r['name']}</td>"
+              f"<td style='padding:8px 12px;border:1px solid #ddd;text-align:right'>{r['total']}</td>"
+              f"<td style='padding:8px 12px;border:1px solid #ddd;text-align:right'>{r['errors']}</td>"
+              f"<td style='padding:8px 12px;border:1px solid #ddd;text-align:right;color:{'#28a745' if r['fail_pct']==0 else '#856404'}'><strong>{r['pass_pct']}%</strong></td>"
+              f"<td style='padding:8px 12px;border:1px solid #ddd;text-align:right;color:{'#6c757d' if r['fail_pct']==0 else '#dc3545'}'>{r['fail_pct']}%</td>"
+              "</tr>"
+              for r in results
+          ) if results else "<tr><td colspan='5' style='padding:8px 12px'>No result data available.</td></tr>"
+
+          html_body = f"""<!DOCTYPE html>
+          <html lang="en">
+          <body style="font-family:Arial,Helvetica,sans-serif;color:#333;margin:0;padding:20px">
+            <h2 style="color:#0366d6;margin-bottom:4px">DemoBlaze Performance Test Results</h2>
+            <p style="color:#586069;margin-top:0">GitHub Actions run completed</p>
+
+            <table style="border-collapse:collapse;margin-bottom:20px;font-size:14px">
+              <tr>
+                <td style="padding:4px 14px 4px 0;font-weight:bold">Repository</td>
+                <td><a href="{server}/{repo}" style="color:#0366d6">{repo}</a></td>
+              </tr>
+              <tr>
+                <td style="padding:4px 14px 4px 0;font-weight:bold">Branch / Ref</td>
+                <td><code style="background:#f1f1f1;padding:2px 5px;border-radius:3px">{ref}</code></td>
+              </tr>
+              <tr>
+                <td style="padding:4px 14px 4px 0;font-weight:bold">Run ID</td>
+                <td><a href="{run_url}" style="color:#0366d6">#{run_id}</a></td>
+              </tr>
+              <tr>
+                <td style="padding:4px 14px 4px 0;font-weight:bold">Triggered by</td>
+                <td>{actor}</td>
+              </tr>
+            </table>
+
+            <h3 style="margin-bottom:8px">Thread Group Summary</h3>
+            <table style="border-collapse:collapse;font-size:14px;width:100%;max-width:640px">
+              <thead>
+                <tr style="background:#0366d6;color:#fff">
+                  <th style="padding:10px 12px;text-align:left;border:1px solid #0262c2">Thread Group</th>
+                  <th style="padding:10px 12px;text-align:right;border:1px solid #0262c2">Total Samples</th>
+                  <th style="padding:10px 12px;text-align:right;border:1px solid #0262c2">Errors</th>
+                  <th style="padding:10px 12px;text-align:right;border:1px solid #0262c2">Pass %</th>
+                  <th style="padding:10px 12px;text-align:right;border:1px solid #0262c2">Fail %</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows_html}
+              </tbody>
+            </table>
+
+            <p style="margin-top:20px;font-size:13px;color:#586069">
+              Full HTML dashboard reports are available as downloadable artifacts in the
+              <a href="{run_url}" style="color:#0366d6">GitHub Actions run</a>.
+            </p>
+          </body>
+          </html>"""
+
+          msg = MIMEMultipart("alternative")
+          msg["Subject"] = f"[DemoBlaze] Performance Test Results — {repo} / {ref} (Run #{run_id})"
+          msg["From"]    = email_from
+          msg["To"]      = email_to
+          msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+          recipients = [addr.strip() for addr in email_to.split(",") if addr.strip()]
+          with smtplib.SMTP(smtp_server, smtp_port) as smtp:
+              smtp.ehlo()
+              smtp.starttls()
+              smtp.login(smtp_username, smtp_password)
+              smtp.sendmail(email_from, recipients, msg.as_string())
+
+          print(f"Email sent successfully to: {email_to}")
+          PYEOF
